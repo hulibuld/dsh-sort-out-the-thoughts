@@ -1,0 +1,8 @@
+# dsh-sort-out-the-thoughts 的官方 patch 层。
+# 安装后 DSH 会把这一条插进 profile 的 loader 树；禁用/启用开关会改写同目录的
+# cordis.patch.yml 里这条的 disabled，不会碰这个文件。
+- insert:
+    - id: sort-out-the-thoughts
+      name: dsh-sort-out-the-thoughts
+      config:
+        maxThoughts: 500

@@ -1,0 +1,54 @@
+{
+  "name": "dsh-sort-out-the-thoughts",
+  "version": "0.3.0",
+  "type": "module",
+  "description": "对话里一个开关进入梳理模式；按「梳理 → 批判 → 调研」三段把模糊想法推成成稿，按体裁存档在 设置 → Thoughts Center。",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "plugin",
+    "socratic",
+    "writing",
+    "brainstorm"
+  ],
+  "license": "MIT",
+  "main": "index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ]
+    },
+    "engines": {
+      "dsh": ">=0.2.0-rc.1"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.2"
+  }
+}

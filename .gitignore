@@ -1,0 +1,11 @@
+# 由 DSH 上传流程补充
+.DS_Store
+Thumbs.db
+desktop.ini
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.local
+.env.*.local
