@@ -75,15 +75,27 @@ window.__ModuleLoader__.load({
       const [pending, setPending] = useState(null)
       const [flash, setFlash] = useState('')
 
+      // 段位有两个来源：用户点按钮改一次，AI 自己调工具又改一次。
+      // 所以本地不自己算段位，一律以 /state 为准，跟宿主对不上就重新拉。
+      const applyState = useCallback((data) => {
+        setOn(data && data.active === true)
+        setCurrent(data && data.current ? data.current : null)
+        setReady(true)
+      }, [])
+
+      const refresh = useCallback(() => {
+        if (!sessionId) return Promise.resolve()
+        return apiGet('/state?sessionId=' + encodeURIComponent(sessionId))
+          .then(applyState)
+          .catch(() => {})
+      }, [sessionId, applyState])
+
       useEffect(() => {
         if (!sessionId) return undefined
         let dead = false
         apiGet('/state?sessionId=' + encodeURIComponent(sessionId))
           .then((data) => {
-            if (dead) return
-            setOn(data && data.active === true)
-            setCurrent(data && data.current ? data.current : null)
-            setReady(true)
+            if (!dead) applyState(data)
           })
           .catch(() => {
             if (!dead) setReady(true)
@@ -91,7 +103,23 @@ window.__ModuleLoader__.load({
         return () => {
           dead = true
         }
-      }, [sessionId])
+      }, [sessionId, applyState])
+
+      // 开着的时候隔几秒对一次账：AI 在会话里把段推进了，按钮不能还停在上一段。
+      useEffect(() => {
+        if (!sessionId || !on || !ready) return undefined
+        const tick = () => {
+          if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+          refresh()
+        }
+        const timer = setInterval(tick, 2500)
+        const onFocus = () => refresh()
+        window.addEventListener('focus', onFocus)
+        return () => {
+          clearInterval(timer)
+          window.removeEventListener('focus', onFocus)
+        }
+      }, [sessionId, on, ready, refresh])
 
       useEffect(() => {
         if (!flash) return undefined
@@ -103,13 +131,17 @@ window.__ModuleLoader__.load({
         if (!sessionId || busy) return
         const next = !on
         setOn(next)
-        if (!next) setPending(null)
+        if (!next) {
+          setPending(null)
+          setCurrent(null)
+        }
         setBusy(true)
         apiPost('/toggle', { sessionId, on: next })
           .then((data) => setOn(data && data.active === true))
           .catch(() => setOn(!next))
           .then(() => setBusy(false))
-      }, [sessionId, on, busy])
+          .then(() => refresh())
+      }, [sessionId, on, busy, refresh])
 
       // 用户自己判断「这一段够了」，点一下就换段，不用等 AI 来问。
       // 第一次点先过机检；缺东西就把缺的摆出来，再点一次仍然可以硬推。
@@ -131,13 +163,12 @@ window.__ModuleLoader__.load({
           .then(({ data }) => {
             if (data && data.ok) {
               setPending(null)
-              setCurrent((prev) =>
-                prev ? { ...prev, phase: data.phase, stage: data.archived ? 'archived' : prev.stage } : prev,
-              )
-              setFlash(data.archived ? '已归档' : '进第 ' + data.phase + ' 段')
+              setFlash(data.archived ? '已归档' : '进第 ' + (Number(data.phase) || 1) + ' 段')
+              refresh()
             } else if (data && data.reason === 'gate') {
               setPending(data.gate || { items: [] })
               setFlash('')
+              refresh()
             } else if (data && data.reason === 'no-thought') {
               setFlash('先聊几句，让 AI 存一次')
             } else if (data && data.reason === 'archived') {
@@ -148,7 +179,7 @@ window.__ModuleLoader__.load({
           })
           .catch(() => setFlash('没成功，再试一次'))
           .then(() => setBusy(false))
-      }, [sessionId, busy, pending])
+      }, [sessionId, busy, pending, refresh])
 
       // 拿不到 sessionId 就不显示：宁缺勿错，别把开关的状态写到别的会话上。
       if (!sessionId) return null
