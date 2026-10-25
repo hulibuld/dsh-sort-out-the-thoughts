@@ -76,9 +76,12 @@ export function apply(ctx, config = {}) {
           if (!current) return MODE_PROMPT
           const phase = normalizePhase(current.phase)
           const meta = PHASES.find((item) => item.id === phase) || PHASES[0]
+          // 从「随想记录本」开出来的思路，第一句素材就在 summary 里，别让用户从头复述。
+          const seed = typeof current.summary === 'string' ? current.summary.trim() : ''
           return (
             MODE_PROMPT +
             `当前进度：第${phase}段「${meta.label}」，想法叫《${current.title || '未命名'}》。` +
+            (seed ? `这条想法的起点是用户记下的一句随想：「${seed.slice(0, 160)}」。第一轮就围绕它提问，别让用户重述。` : '') +
             '用户随时可以点输入框旁的「推进」按钮手动换段，那表示他认为这一段够了：你从下一段接着做，不要再回头补上一段。'
           )
         } catch {

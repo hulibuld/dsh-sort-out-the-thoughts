@@ -4,6 +4,7 @@
  * 只挂两个位置：
  *   conversation.input.left  输入框左边的「梳理」开关（session 作用域，宿主给 sessionId）
  *   settings.section         设置里的 Thoughts Center 页
+ *   shell.overlay            随想悬浮球 + 草稿本挂件（整框之上，不会被会话内容压住）
  *
  * 不 import 宿主包，只用注入的 react，所以换宿主版本时炸的机会最小。
  */
@@ -13,7 +14,7 @@ window.__ModuleLoader__.load({
     const out = exports || (module && module.exports) || {}
     const React = require('react')
     const h = React.createElement
-    const { useState, useEffect, useMemo, useCallback } = React
+    const { useState, useEffect, useMemo, useCallback, useRef, useSyncExternalStore } = React
 
     const API = '/plugins/dsh-sort-out-the-thoughts'
     const GENRES = ['文章', '演讲稿', '自媒体文稿', '其他']
@@ -60,6 +61,761 @@ window.__ModuleLoader__.load({
       if (Number.isNaN(date.getTime())) return ''
       const pad = (n) => String(n).padStart(2, '0')
       return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+    }
+
+    // ============================================================
+    // 随想记录本：碎想法先丢进来。做成一颗悬浮球，点开是一本带横线的草稿本。
+    // ============================================================
+
+    const DOCK_STORAGE_KEY = 'dsh-sort-out-the-thoughts:dock:v5'
+    const DOCK_WIDTH = 372
+    const BALL_SIZE = 58
+    const NOTE_LINE = 28
+    const PANEL_SHORT = 332
+    const PANEL_TALL = 592
+    const HAND_FONT = '"Kaiti SC","STKaiti","KaiTi","Songti SC","STSong",serif'
+
+    const LINES_RULE =
+      'repeating-linear-gradient(to bottom, transparent 0 ' + (NOTE_LINE - 1) + 'px, var(--st-line) ' +
+      (NOTE_LINE - 1) + 'px ' + NOTE_LINE + 'px)'
+    const MARGIN_RULE = {
+      position: 'absolute',
+      left: 34,
+      top: 0,
+      bottom: 0,
+      width: 1,
+      background: 'var(--st-margin)',
+      pointerEvents: 'none',
+    }
+
+    // 四种纸色。球和本子共用一套，换色是换整本。
+    const THEMES = [
+      {
+        id: 'paper',
+        name: '纸米黄',
+        swatch: '#F0E4C4',
+        base: '#FBF6E4',
+        sheet: '#F1E9D1',
+        line: 'rgba(128, 96, 56, 0.22)',
+        margin: 'rgba(196, 86, 74, 0.42)',
+        ink: '#453C30',
+        faint: '#8D7F64',
+        cover: '#EADCB8',
+        coverEdge: '#D6C49B',
+        ring: '#B3A181',
+        accent: '#B4553C',
+      },
+      {
+        id: 'green',
+        name: '护眼绿',
+        swatch: '#CFE3C6',
+        base: '#E9F2E1',
+        sheet: '#DDEBD2',
+        line: 'rgba(74, 108, 66, 0.20)',
+        margin: 'rgba(180, 92, 74, 0.36)',
+        ink: '#2F3A2C',
+        faint: '#75866F',
+        cover: '#D3E4C8',
+        coverEdge: '#BFD3B2',
+        ring: '#93A98A',
+        accent: '#A7573F',
+      },
+      {
+        id: 'white',
+        name: '白纸',
+        swatch: '#FFFFFF',
+        base: '#FFFFFF',
+        sheet: '#F2F4F7',
+        line: 'rgba(88, 104, 128, 0.20)',
+        margin: 'rgba(96, 132, 190, 0.34)',
+        ink: '#2A3038',
+        faint: '#8B939E',
+        cover: '#F4F6F9',
+        coverEdge: '#DCE1E8',
+        ring: '#B7C0CB',
+        accent: '#3B6FD4',
+      },
+      {
+        id: 'dark',
+        name: '黑（深灰）',
+        swatch: '#3A3F46',
+        base: '#2E3238',
+        sheet: '#33383F',
+        line: 'rgba(255, 255, 255, 0.11)',
+        margin: 'rgba(255, 128, 112, 0.40)',
+        ink: '#E7E9EC',
+        faint: '#9BA2AB',
+        cover: '#3B4047',
+        coverEdge: '#4C525A',
+        ring: '#7B838D',
+        accent: '#E8937C',
+      },
+    ]
+
+    const THEME_BY_ID = {}
+    THEMES.forEach((theme) => {
+      THEME_BY_ID[theme.id] = theme
+    })
+
+    function readDockState() {
+      const fallback = { x: null, y: null, px: null, py: null, open: false, theme: 'paper', expanded: false }
+      try {
+          let raw = window.localStorage.getItem(DOCK_STORAGE_KEY)
+        if (!raw) raw = window.localStorage.getItem('dsh-sort-out-the-thoughts:dock:v4')
+        if (!raw) return fallback
+        const parsed = JSON.parse(raw)
+        if (!parsed || typeof parsed !== 'object') return fallback
+        const num = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null)
+        return {
+          x: num(parsed.x),
+          y: num(parsed.y),
+          px: num(parsed.px),
+          py: num(parsed.py),
+          open: parsed.open === true,
+          theme: typeof parsed.theme === 'string' && THEME_BY_ID[parsed.theme] ? parsed.theme : 'paper',
+          expanded: parsed.expanded === true,
+        }
+      } catch (error) {
+        return fallback
+      }
+    }
+
+    function writeDockState(state) {
+      try {
+        window.localStorage.setItem(DOCK_STORAGE_KEY, JSON.stringify(state))
+      } catch (error) {
+        /* 存不上不影响用 */
+      }
+    }
+
+    function viewportSize() {
+      return {
+        w: typeof window === 'undefined' ? 1440 : window.innerWidth,
+        h: typeof window === 'undefined' ? 900 : window.innerHeight,
+      }
+    }
+
+    const VIEW_MARGIN = 12
+
+    function clampToViewport(x, y, width, height) {
+      const view = viewportSize()
+      return {
+        x: Math.min(Math.max(VIEW_MARGIN, x), Math.max(VIEW_MARGIN, view.w - width - VIEW_MARGIN)),
+        y: Math.min(Math.max(VIEW_MARGIN, y), Math.max(VIEW_MARGIN, view.h - height - VIEW_MARGIN)),
+      }
+    }
+
+    // 根作用域的组件拿不到会话 id，改从客户端 uiSession 绑定里读当前会话。
+    function useCurrentSession(binding) {
+      const subscribe = useCallback(
+        (listener) => (binding && typeof binding.subscribe === 'function' ? binding.subscribe(listener) : () => {}),
+        [binding],
+      )
+      const getSnapshot = useCallback(() => {
+        if (!binding || typeof binding.getSnapshot !== 'function') return ''
+        const value = binding.getSnapshot()
+        const key = value && typeof value === 'object' ? value.key : undefined
+        return typeof key === 'string' ? key : ''
+      }, [binding])
+      return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+    }
+
+    // 随想的读写与状态，挂件页和整页共用一套。
+    function useSparkBook() {
+      const [text, setText] = useState('')
+      const [items, setItems] = useState([])
+      const [busy, setBusy] = useState('')
+      const [flash, setFlash] = useState('')
+      const [loaded, setLoaded] = useState(false)
+
+      const load = useCallback(
+        () =>
+          apiGet('/sparks')
+            .then((data) => setItems(data && Array.isArray(data.sparks) ? data.sparks : []))
+            .catch(() => {})
+            .then(() => setLoaded(true)),
+        [],
+      )
+
+      useEffect(() => {
+        load()
+      }, [load])
+
+      useEffect(() => {
+        if (!flash) return undefined
+        const timer = setTimeout(() => setFlash(''), 2800)
+        return () => clearTimeout(timer)
+      }, [flash])
+
+      const add = useCallback(() => {
+        const value = text.trim()
+        if (!value || busy) return
+        setBusy('add')
+        apiPost('/spark/add', { text: value })
+          .then(() => {
+            setText('')
+            return load().then(() => setFlash('记下了'))
+          })
+          .catch(() => setFlash('没记上，再试一次'))
+          .then(() => setBusy(''))
+      }, [text, busy, load])
+
+      const remove = useCallback(
+        (id) => {
+          if (busy) return
+          setBusy(id)
+          apiPost('/spark/delete', { id })
+            .then(() => load())
+            .catch(() => setFlash('没删掉'))
+            .then(() => setBusy(''))
+        },
+        [busy, load],
+      )
+
+      // 从这条随想开一条新思路，顺手把这个会话的梳理开关打开。
+      const start = useCallback(
+        (id, sessionId, onDone) => {
+          if (busy) return
+          if (!sessionId) {
+            setFlash('先打开一个对话，再点「去研究」')
+            return
+          }
+          setBusy(id)
+          apiPost('/spark/start', { id, sessionId })
+            .then((data) => {
+              if (data && data.ok) {
+                setFlash('已就绪：回到对话说一句就开始梳')
+                load()
+                if (onDone) onDone()
+              } else {
+                setFlash('没开成，再试一次')
+              }
+            })
+            .catch(() => setFlash('没开成，再试一次'))
+            .then(() => setBusy(''))
+        },
+        [busy, load],
+      )
+
+      return { text, setText, items, busy, flash, loaded, add, remove, start }
+    }
+
+    function SparkComposer(props) {
+      const { text, setText, add, busy, flash } = props
+      const ready = Boolean(text.trim()) && !busy
+      return h(
+        'div',
+        {
+          style: {
+            position: 'relative',
+            display: 'flex',
+            flexDirection: 'column',
+            flex: '1 1 auto',
+            minHeight: 0,
+            padding: '2px 14px 6px 44px',
+            backgroundImage: LINES_RULE,
+            backgroundAttachment: 'local',
+          },
+        },
+        h('div', { 'aria-hidden': 'true', style: MARGIN_RULE }),
+        h('textarea', {
+          value: text,
+          rows: props.rows || 3,
+          placeholder: '想到什么就写下来，一句话也行',
+          onChange: (event) => setText(event.target.value),
+          onKeyDown: (event) => {
+            if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault()
+              add()
+            }
+          },
+          style: {
+            width: '100%',
+            boxSizing: 'border-box',
+            resize: 'none',
+            border: 'none',
+            outline: 'none',
+            background: 'transparent',
+            color: 'var(--st-ink)',
+            fontFamily: HAND_FONT,
+            fontSize: 14,
+            lineHeight: NOTE_LINE + 'px',
+            padding: 0,
+            flex: '1 1 auto',
+            minHeight: 56,
+          },
+        }),
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8, paddingBottom: 4 } },
+          h(
+            'button',
+            {
+              type: 'button',
+              onClick: add,
+              disabled: !ready,
+              style: {
+                padding: '0 10px',
+                borderRadius: 3,
+                fontFamily: HAND_FONT,
+                fontSize: 12.5,
+                lineHeight: '20px',
+                cursor: ready ? 'pointer' : 'default',
+                border: '1px solid var(--st-edge)',
+                background: 'var(--st-cover)',
+                color: 'var(--st-ink)',
+                opacity: ready ? 1 : 0.5,
+              },
+            },
+            busy === 'add' ? '记着呢' : '记下',
+          ),
+          flash ? h('span', { style: { fontFamily: HAND_FONT, fontSize: 11.5, color: 'var(--st-faint)' } }, flash) : null,
+        ),
+      )
+    }
+
+    function SparkRows(props) {
+      const { items, busy, sessionId, loaded, onStart, onRemove } = props
+      if (!items.length) {
+        return h(
+          'div',
+          { style: { fontFamily: HAND_FONT, fontSize: 13, lineHeight: NOTE_LINE + 'px', color: 'var(--st-faint)', paddingTop: 4 } },
+          loaded ? '还空着。想到什么先写一句。' : '翻页中…',
+        )
+      }
+      return h(
+        'div',
+        { style: { display: 'flex', flexDirection: 'column' } },
+        items.map((spark) =>
+          h(
+            'div',
+            { key: spark.id, style: { paddingTop: 2 } },
+            h(
+              'div',
+              {
+                style: {
+                  fontFamily: HAND_FONT,
+                  fontSize: 14,
+                  lineHeight: NOTE_LINE + 'px',
+                  color: 'var(--st-ink)',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                },
+              },
+              spark.text,
+            ),
+            h(
+              'div',
+              { style: { display: 'flex', alignItems: 'center', gap: 8, paddingBottom: 4 } },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  onClick: () => onStart(spark.id),
+                  disabled: Boolean(busy),
+                  title: '从这条随想开一条新思路，并把梳理模式打开',
+                  style: {
+                    padding: 0,
+                    border: 'none',
+                    background: 'transparent',
+                    color: 'var(--st-accent)',
+                    fontFamily: HAND_FONT,
+                    fontSize: 12.5,
+                    lineHeight: '20px',
+                    cursor: busy ? 'progress' : 'pointer',
+                    textDecoration: 'underline',
+                    textDecorationStyle: 'dotted',
+                  },
+                },
+                spark.thoughtId ? '接着研究 →' : '去研究 →',
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  onClick: () => onRemove(spark.id),
+                  disabled: Boolean(busy),
+                  style: {
+                    padding: 0,
+                    border: 'none',
+                    background: 'transparent',
+                    color: 'var(--st-faint)',
+                    fontFamily: HAND_FONT,
+                    fontSize: 11,
+                    lineHeight: '20px',
+                    cursor: 'pointer',
+                  },
+                },
+                '撕掉',
+              ),
+              sessionId ? null : h('span', { style: { fontSize: 10, color: 'var(--st-faint)' } }, '（先开个对话）'),
+              h(
+                'span',
+                { style: { marginLeft: 'auto', fontFamily: HAND_FONT, fontSize: 10.5, color: 'var(--st-faint)' } },
+                formatTime(spark.createdAt),
+              ),
+            ),
+          ),
+        ),
+      )
+    }
+
+    // 悬浮挂件：同一颗东西两种形态。球 ↔ 本子，位置共享，收起来就变回球。
+    function SparkDock(props) {
+      const sessionId = useCurrentSession(props.currentSession)
+      const book = useSparkBook()
+      const [state, setState] = useState(readDockState)
+      const [drag, setDrag] = useState(null)
+      const gesture = useRef(null)
+      const shown = useRef({ x: 0, y: 0 })
+      const panelDragged = useRef(false)
+
+      const theme = THEME_BY_ID[state.theme] || THEMES[0]
+      const panelHeight = state.expanded ? PANEL_TALL : PANEL_SHORT
+
+      // 球和本子各记各的位置：收起时球回到它自己原来待的地方，不会跟着本子的左上角跑。
+      const fallbackAt = { x: viewportSize().w - BALL_SIZE - 26, y: viewportSize().h - BALL_SIZE - 96 }
+      const ballAt = clampToViewport(
+        state.x === null ? fallbackAt.x : state.x,
+        state.y === null ? fallbackAt.y : state.y,
+        BALL_SIZE,
+        BALL_SIZE,
+      )
+      const panelAt = clampToViewport(
+        state.px === null ? ballAt.x : state.px,
+        state.py === null ? ballAt.y : state.py,
+        DOCK_WIDTH,
+        panelHeight,
+      )
+      shown.current = state.open ? { x: panelAt.x, y: panelAt.y } : { x: ballAt.x, y: ballAt.y }
+
+      useEffect(() => {
+        writeDockState(state)
+      }, [state])
+
+      useEffect(() => {
+        if (!drag) return undefined
+        const move = (event) => {
+          const dx = event.clientX - drag.atX
+          const dy = event.clientY - drag.atY
+          const size = drag.kind === 'ball' ? BALL_SIZE : panelHeight
+          const width = drag.kind === 'ball' ? BALL_SIZE : DOCK_WIDTH
+          const next = clampToViewport(drag.fromX + dx, drag.fromY + dy, width, size)
+          if (drag.kind === 'panel') panelDragged.current = true
+          setState((prev) =>
+            drag.kind === 'ball' ? { ...prev, x: next.x, y: next.y } : { ...prev, px: next.x, py: next.y },
+          )
+        }
+        const up = () => {
+          const moved = gesture.current ? gesture.current.moved : 99
+          gesture.current = null
+          setDrag(null)
+          if (drag.kind === 'ball' && moved < 6) {
+            // 球当场摊开成本子：原地长，长不下就往左/往上借空间，仍然贴着球原来的位置。
+            const from = shown.current
+            const view = viewportSize()
+            const fitsRight = from.x + DOCK_WIDTH <= view.w - VIEW_MARGIN
+            const fitsDown = from.y + panelHeight <= view.h - VIEW_MARGIN
+            const anchorX = fitsRight ? from.x : from.x + BALL_SIZE - DOCK_WIDTH
+            const anchorY = fitsDown ? from.y : from.y + BALL_SIZE - panelHeight
+            const next = clampToViewport(anchorX, anchorY, DOCK_WIDTH, panelHeight)
+            panelDragged.current = false
+            setState((prev) => ({ ...prev, open: true, px: next.x, py: next.y }))
+          }
+        }
+        window.addEventListener('pointermove', move)
+        window.addEventListener('pointerup', up)
+        window.addEventListener('pointercancel', up)
+        return () => {
+          window.removeEventListener('pointermove', move)
+          window.removeEventListener('pointerup', up)
+          window.removeEventListener('pointercancel', up)
+        }
+      }, [drag, panelHeight])
+
+      const startDrag = (kind, event) => {
+        if (event.button !== 0) return
+        if (event.target && event.target.closest && event.target.closest('[data-no-drag]')) return
+        gesture.current = { moved: 0 }
+        setDrag({ kind, atX: event.clientX, atY: event.clientY, fromX: shown.current.x, fromY: shown.current.y })
+        event.preventDefault()
+      }
+
+      const track = () => {
+        if (gesture.current) gesture.current.moved += 1
+      }
+
+      const vars = {
+        '--st-base': theme.base,
+        '--st-sheet': theme.sheet,
+        '--st-line': theme.line,
+        '--st-margin': theme.margin,
+        '--st-ink': theme.ink,
+        '--st-faint': theme.faint,
+        '--st-cover': theme.cover,
+        '--st-edge': theme.coverEdge,
+        '--st-ring': theme.ring,
+        '--st-accent': theme.accent,
+      }
+
+      if (!state.open) {
+        return h(
+          'div',
+          {
+            onPointerDown: (event) => startDrag('ball', event),
+            onPointerMove: track,
+            title: '随想记录本：想到什么先记下来',
+            role: 'button',
+            'aria-label': '打开随想记录本',
+            'aria-expanded': 'false',
+            style: {
+              ...vars,
+              position: 'fixed',
+              left: ballAt.x,
+              top: ballAt.y,
+              width: BALL_SIZE,
+              height: BALL_SIZE,
+              borderRadius: '50%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: 'radial-gradient(circle at 32% 26%, color-mix(in srgb, ' + theme.base + ' 92%, white) 0%, ' + theme.base + ' 46%, ' + theme.coverEdge + ' 100%)',
+              border: '1px solid ' + theme.coverEdge,
+              boxShadow: '0 10px 24px rgba(40,32,20,0.26), inset 0 1px 0 rgba(255,255,255,0.7)',
+              cursor: drag ? 'grabbing' : 'grab',
+              zIndex: 950,
+              touchAction: 'none',
+              userSelect: 'none',
+            },
+          },
+          h('span', { 'aria-hidden': 'true', style: { fontSize: 26, lineHeight: 1 } }, '📒'),
+          book.items.length
+            ? h(
+                'span',
+                {
+                  style: {
+                    position: 'absolute',
+                    top: -2,
+                    right: -2,
+                    minWidth: 18,
+                    height: 18,
+                    padding: '0 4px',
+                    borderRadius: 9,
+                    background: theme.accent,
+                    color: '#FFF8EC',
+                    fontSize: 10,
+                    lineHeight: '18px',
+                    textAlign: 'center',
+                    fontWeight: 600,
+                  },
+                },
+                String(book.items.length),
+              )
+            : null,
+        )
+      }
+
+      const rings = h(
+        'div',
+        {
+          'aria-hidden': 'true',
+          onPointerDown: (event) => startDrag('panel', event),
+          onPointerMove: track,
+          title: '按住这里拖本子',
+          style: {
+            cursor: drag ? 'grabbing' : 'grab',
+            touchAction: 'none',
+            display: 'flex',
+            justifyContent: 'space-evenly',
+            alignItems: 'center',
+            height: 16,
+            padding: '0 14px',
+            background: 'linear-gradient(' + theme.cover + ', ' + theme.coverEdge + ')',
+            borderBottom: '1px solid ' + theme.line,
+          },
+        },
+        [0, 1, 2, 3, 4, 5, 6, 7].map((index) =>
+          h('span', {
+            key: index,
+            style: {
+              width: 11,
+              height: 11,
+              borderRadius: '50%',
+              border: '2px solid ' + theme.ring,
+              background: 'linear-gradient(160deg, ' + theme.base + ', ' + theme.sheet + ')',
+              boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.18)',
+            },
+          }),
+        ),
+      )
+
+      const swatches = THEMES.map((candidate) =>
+        h(
+          'button',
+          {
+            key: candidate.id,
+            type: 'button',
+            'data-no-drag': 'true',
+            onClick: () => setState((prev) => ({ ...prev, theme: candidate.id })),
+            title: candidate.name,
+            'aria-label': '纸色：' + candidate.name,
+            'aria-pressed': candidate.id === theme.id ? 'true' : 'false',
+            style: {
+              width: 15,
+              height: 15,
+              padding: 0,
+              borderRadius: '50%',
+              cursor: 'pointer',
+              background: candidate.swatch,
+              border: candidate.id === theme.id ? '2px solid ' + theme.accent : '1px solid ' + theme.coverEdge,
+              boxShadow: candidate.id === theme.id ? '0 0 0 2px color-mix(in srgb, ' + theme.accent + ' 22%, transparent)' : 'none',
+            },
+          },
+        ),
+      )
+
+      const head = h(
+        'div',
+        {
+          onPointerDown: (event) => startDrag('panel', event),
+          onPointerMove: track,
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '8px 12px 6px 16px',
+            cursor: drag ? 'grabbing' : 'grab',
+            userSelect: 'none',
+            touchAction: 'none',
+          },
+        },
+        h('span', { style: { fontFamily: HAND_FONT, fontSize: 15.5, fontWeight: 700, letterSpacing: '0.04em', color: theme.ink } }, '随想记录本'),
+        h('div', { 'data-no-drag': 'true', style: { display: 'flex', alignItems: 'center', gap: 5, marginLeft: 'auto' } }, swatches),
+        h(
+          'button',
+          {
+            type: 'button',
+            'data-no-drag': 'true',
+            onClick: () => {
+              const at = shown.current
+              if (!panelDragged.current) {
+                // 没动过本子：球原地回来，位置一点不变。
+                setState((prev) => ({ ...prev, open: false }))
+                return
+              }
+              // 本子被拖走过：球跟到本子的右下角，别让它在老地方凭空冒出来。
+              const back = clampToViewport(
+                at.x + DOCK_WIDTH - BALL_SIZE,
+                at.y + panelHeight - BALL_SIZE,
+                BALL_SIZE,
+                BALL_SIZE,
+              )
+              panelDragged.current = false
+              setState((prev) => ({ ...prev, open: false, x: back.x, y: back.y }))
+            },
+            title: '收起（变回球）',
+            style: {
+              width: 22,
+              height: 22,
+              marginLeft: 4,
+              border: '1px solid ' + theme.coverEdge,
+              borderRadius: 11,
+              background: 'transparent',
+              color: theme.faint,
+              fontSize: 13,
+              lineHeight: 1,
+              cursor: 'pointer',
+            },
+          },
+          '×',
+        ),
+      )
+
+      const toggleRow = h(
+        'button',
+        {
+          type: 'button',
+          'data-no-drag': 'true',
+          onClick: () => setState((prev) => ({ ...prev, expanded: !prev.expanded })),
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            width: '100%',
+            padding: '2px 14px 8px 44px',
+            border: 'none',
+            background: 'transparent',
+            color: theme.faint,
+            fontFamily: HAND_FONT,
+            fontSize: 12,
+            lineHeight: '22px',
+            cursor: 'pointer',
+            textAlign: 'left',
+          },
+        },
+        h('span', { 'aria-hidden': 'true', style: { fontSize: 10 } }, state.expanded ? '▾' : '▸'),
+        '随想记录',
+        h('span', { style: { color: theme.ink } }, String(book.items.length)),
+        h('span', null, '条'),
+        h('span', { style: { marginLeft: 'auto', fontSize: 11 } }, state.expanded ? '收起' : '展开'),
+      )
+
+      return h(
+        'div',
+        {
+          style: {
+            ...vars,
+            position: 'fixed',
+            left: panelAt.x,
+            top: panelAt.y,
+            width: DOCK_WIDTH,
+            maxWidth: 'calc(100vw - 16px)',
+            height: panelHeight,
+            maxHeight: 'calc(100vh - 16px)',
+            display: 'flex',
+            flexDirection: 'column',
+            borderRadius: 6,
+            background: theme.base,
+            border: '1px solid ' + theme.coverEdge,
+            boxShadow:
+              '0 2px 0 ' + theme.sheet + ', 0 3px 0 ' + theme.base + ', 0 4px 0 ' + theme.sheet +
+              ', 0 20px 44px rgba(30,24,14,0.34)',
+            overflow: 'hidden',
+            color: theme.ink,
+            font: 'inherit',
+            zIndex: 951,
+          },
+        },
+        rings,
+        head,
+        h(SparkComposer, { text: book.text, setText: book.setText, add: book.add, busy: book.busy, flash: book.flash }),
+        toggleRow,
+        state.expanded
+          ? h(
+              'div',
+              {
+                style: {
+                  position: 'relative',
+                  flex: 1,
+                  minHeight: 0,
+                  overflow: 'auto',
+                  padding: '0 14px 12px 44px',
+                  backgroundImage: LINES_RULE,
+                  backgroundAttachment: 'local',
+                },
+              },
+              h('div', { 'aria-hidden': 'true', style: MARGIN_RULE }),
+              h(SparkRows, {
+                items: book.items,
+                busy: book.busy,
+                loaded: book.loaded,
+                sessionId,
+                onStart: (id) => book.start(id, sessionId),
+                onRemove: book.remove,
+              }),
+            )
+          : null,
+      )
     }
 
     // ============================================================
@@ -589,6 +1345,18 @@ window.__ModuleLoader__.load({
       const [query, setQuery] = useState('')
       const [genre, setGenre] = useState('')
       const [openId, setOpenId] = useState('')
+      const [tab, setTab] = useState('thoughts')
+      const [sparks, setSparks] = useState(null)
+
+      const loadSparks = useCallback(() => {
+        apiGet('/sparks')
+          .then((data) => setSparks(Array.isArray(data.sparks) ? data.sparks : []))
+          .catch(() => setSparks([]))
+      }, [])
+
+      useEffect(() => {
+        loadSparks()
+      }, [loadSparks])
 
       const load = useCallback(() => {
         apiGet('/thoughts')
@@ -643,16 +1411,109 @@ window.__ModuleLoader__.load({
         })
       }
 
-      return h(
+      const tabRow = h(
         'div',
-        { style: { color: C.text } },
+        { style: { display: 'flex', gap: 6, margin: '0 0 14px' } },
+        h(Chip, { label: '思路', active: tab === 'thoughts', onClick: () => setTab('thoughts') }),
+        h(Chip, {
+          label: sparks === null ? '随想' : '随想 · ' + sparks.length,
+          active: tab === 'sparks',
+          onClick: () => {
+            setTab('sparks')
+            loadSparks()
+          },
+        }),
+      )
+
+      const sparksBody = h(
+        'div',
+        null,
+        h(
+          'p',
+          { style: { fontSize: 12, color: C.muted, margin: '0 0 12px', lineHeight: 1.65 } },
+          '悬浮挂件里记下的随想都在这儿。点「去研究」会新开一个对话，把那条随想当成起点。',
+        ),
+        sparks === null
+          ? h('div', { style: { fontSize: 12, color: C.faint, padding: '18px 0' } }, '读取中…')
+          : sparks.length === 0
+            ? h(
+                'div',
+                {
+                  style: {
+                    padding: '26px 18px',
+                    borderRadius: 12,
+                    border: '1px dashed ' + C.border,
+                    textAlign: 'center',
+                    color: C.muted,
+                    fontSize: 12.5,
+                    lineHeight: 1.8,
+                  },
+                },
+                '还是一条随想都没有。右下角那颗小球点开，先记一句。',
+              )
+            : h(
+                'div',
+                { style: { display: 'grid', gap: 8 } },
+                sparks.map((spark) =>
+                  h(
+                    'div',
+                    {
+                      key: spark.id,
+                      style: {
+                        padding: '10px 12px',
+                        borderRadius: 10,
+                        border: '1px solid ' + C.borderSoft,
+                        background: C.surface,
+                      },
+                    },
+                    h(
+                      'div',
+                      { style: { fontSize: 12.5, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } },
+                      spark.text,
+                    ),
+                    h(
+                      'div',
+                      { style: { display: 'flex', alignItems: 'center', gap: 10, marginTop: 8, fontSize: 11, color: C.faint } },
+                      h('span', null, formatTime(spark.createdAt)),
+                      spark.thoughtId ? h('span', { style: { color: C.accent } }, '已开过思路') : h('span', null, '还没研究过'),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          onClick: () => {
+                            apiPost('/spark/delete', { id: spark.id })
+                              .then(loadSparks)
+                              .catch(() => {})
+                          },
+                          style: {
+                            marginLeft: 'auto',
+                            padding: 0,
+                            border: 'none',
+                            background: 'transparent',
+                            color: C.faint,
+                            fontSize: 11,
+                            cursor: 'pointer',
+                          },
+                        },
+                        '删掉',
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+      )
+
+      const headParts = [
         h('h2', { style: { fontSize: 15, fontWeight: 650, margin: '0 0 4px' } }, 'Thoughts Center'),
         h(
           'p',
-          { style: { fontSize: 12, color: C.muted, margin: '0 0 14px', lineHeight: 1.65 } },
+          { style: { fontSize: 12, color: C.muted, margin: '0 0 12px', lineHeight: 1.65 } },
           '梳理过的想法都在这里，按体裁归档。每条都能看到它从一句模糊的话长到成稿的轨迹，也能接着往下追问。',
         ),
+        tabRow,
+      ]
 
+      const thoughtsBody = [
         h(
           'div',
           { style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 } },
@@ -717,7 +1578,9 @@ window.__ModuleLoader__.load({
                   ),
                 ),
               ),
-      )
+      ]
+
+      return h('div', { style: { color: C.text } }, ...headParts, tab === 'sparks' ? sparksBody : thoughtsBody)
     }
 
     // ============================================================
@@ -756,10 +1619,29 @@ window.__ModuleLoader__.load({
           ),
         'sort-out-the-thoughts: Thoughts Center 设置页',
       )
+
+      // 悬浮挂件挂在整框浮层，高于所有栏目，不会被会话内容盖住。
+      ctx.effect(
+        () =>
+          ctx.slots.inject('shell.overlay', () =>
+            ctx.slots.register(
+              {
+                name: 'shell.overlay',
+                id: 'sort-out-thoughts-dock',
+                order: 70,
+                label: '随想记录本',
+                inject: () => ({ currentSession: ctx.uiSession.adapter.current }),
+              },
+              SparkDock,
+            ),
+          ),
+        'sort-out-the-thoughts: 随想悬浮挂件',
+      )
+
     }
 
     out.apply = apply
-    out.inject = ['slots']
+    out.inject = ['slots', 'uiSession']
     return out
   },
 })
