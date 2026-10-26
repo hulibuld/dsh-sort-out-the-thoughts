@@ -1,6 +1,6 @@
 {
   "name": "dsh-sort-out-the-thoughts",
-  "version": "0.3.5",
+  "version": "0.3.7",
   "type": "module",
   "description": "对话里一个开关进入梳理模式；按「梳理 → 批判 → 调研」三段把模糊想法推成成稿，按体裁存档在 设置 → Thoughts Center。输入框旁另有「随想记录本」，碎灵感先存着，一键开梳。",
   "author": "hulibuld (https://github.com/hulibuld)",

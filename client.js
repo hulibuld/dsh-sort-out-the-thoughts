@@ -220,6 +220,166 @@ window.__ModuleLoader__.load({
       return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
     }
 
+    // ============================================================
+    // 「去研究」：新开一条会话，把随想直接写进那条会话的输入框
+    // ============================================================
+    // 客户端服务只有在 apply(ctx) 里拿得到，而组件是纯函数，所以留一个模块级引用，
+    // 点到按钮的那一刻再去取服务，不把服务对象一路当 props 传下去。
+    let runtimeCtx = null
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms))
+    }
+
+    function sessionCatalog(ctx) {
+      try {
+        const list = ctx && ctx.sessions && ctx.sessions.list
+        const snap = list && typeof list.getSnapshot === 'function' ? list.getSnapshot() : null
+        return snap && snap.byId && typeof snap.byId === 'object' ? snap.byId : {}
+      } catch (error) {
+        return {}
+      }
+    }
+
+    // 主区当前显示哪条会话：catalog 的行上带 retainedBy.mainView 计数。
+    function mainViewSessionId(byId) {
+      for (const row of Object.values(byId || {})) {
+        if (row && typeof row.id === 'string' && ((row.retainedBy && row.retainedBy.mainView) || 0) > 0) return row.id
+      }
+      return ''
+    }
+
+    function researchDraft(spark) {
+      const body = String((spark && spark.text) || '').trim()
+      return [body, '', '先把这条想法梳理清楚：它到底在说什么，哪里还含糊，下一步该往哪儿想。'].join('\n')
+    }
+
+    // startSession 是官方的“新会话”，可以顺带把初始内容（prompt）写进草稿；
+    // 但它不返回 id，只能盯着会话清单里新冒出来的那一条。
+    async function waitForNewSession(ctx, before) {
+      for (let i = 0; i < 15; i += 1) {
+        const byId = sessionCatalog(ctx)
+        const fresh = Object.keys(byId).filter((id) => !before.has(id))
+        if (fresh.length > 0) {
+          const shown = mainViewSessionId(byId)
+          return fresh.includes(shown) ? shown : fresh[fresh.length - 1]
+        }
+        await sleep(100)
+      }
+      return ''
+    }
+
+    function composerOf(ctx, sessionId) {
+      const conversation = ctx && typeof ctx.get === 'function' ? ctx.get('conversation') : undefined
+      const input = conversation && conversation.input
+      if (!input || typeof input.for !== 'function') return null
+      const scope = ctx.sessions && typeof ctx.sessions.scope === 'function' ? ctx.sessions.scope(sessionId) : undefined
+      if (scope === undefined || scope === null) return null
+      try {
+        return input.for(scope)
+      } catch (error) {
+        return null
+      }
+    }
+
+    function draftOf(ctx, sessionId) {
+      const composer = composerOf(ctx, sessionId)
+      if (!composer || !composer.state || typeof composer.state.getSnapshot !== 'function') return null
+      try {
+        const snapshot = composer.state.getSnapshot()
+        return snapshot && typeof snapshot.draft === 'string' ? snapshot.draft : null
+      } catch (error) {
+        return null
+      }
+    }
+
+    // 官方通道偶尔还没把字落进 composer，兜底自己再写一遍。
+    async function ensureDraft(ctx, sessionId, text) {
+      for (let i = 0; i < 14; i += 1) {
+        const current = draftOf(ctx, sessionId)
+        if (current === text) return ''
+        const composer = composerOf(ctx, sessionId)
+        if (composer && typeof composer.setDraft === 'function') {
+          try {
+            composer.setDraft(text)
+          } catch (error) {
+            /* 下一轮再试 */
+          }
+        }
+        await sleep(150)
+      }
+      return draftOf(ctx, sessionId) === text ? '' : '输入框没能自动填上，本子里那句话可以直接复制'
+    }
+
+    // 返回 { ok, sessionId, reason }；reason 只在要提示用户时给。
+    async function openResearchSession(spark) {
+      const ctx = runtimeCtx
+      if (!ctx || typeof ctx.get !== 'function') return { ok: false, reason: '插件还没挂好' }
+
+      const uiWorkspace = ctx.get('uiWorkspace')
+      if (!uiWorkspace || typeof uiWorkspace.startSession !== 'function') {
+        return { ok: false, reason: '这个版本不支持新建会话' }
+      }
+      if (!ctx.sessions || typeof ctx.sessions.scope !== 'function') {
+        return { ok: false, reason: '会话服务没就绪，再点一次' }
+      }
+
+      const registry = ctx.get('workspaces')
+      const before = new Set(Object.keys(sessionCatalog(ctx)))
+      const here = mainViewSessionId(sessionCatalog(ctx))
+
+      let workspaceId = ''
+      try {
+        const snap = registry && registry.list ? registry.list.getSnapshot() : null
+        const items = snap && Array.isArray(snap.items) ? snap.items : []
+        const owner = items.find((item) => Array.isArray(item.sessionIds) && item.sessionIds.includes(here))
+        const target = owner || items[0]
+        if (target) workspaceId = target.workspaceId || target.id || ''
+      } catch (error) {
+        workspaceId = ''
+      }
+      if (!workspaceId) return { ok: false, reason: '先打开一个工作区' }
+
+      const text = researchDraft(spark)
+
+      // 官方“新会话”通道自带草稿初始化：prompt 就是输入框里的内容。
+      try {
+        uiWorkspace.startSession(workspaceId, { prompt: text, clearPreviousDraft: true, whenDraftExists: 'replace' })
+      } catch (error) {
+        /* 降级到下面的兜底 */
+      }
+
+      let sessionId = await waitForNewSession(ctx, before)
+      // 复用当前那条空白会话时不会冒出新 id，此时目标就是它本身。
+      if (!sessionId) sessionId = mainViewSessionId(sessionCatalog(ctx)) || here
+      if (!sessionId && typeof uiWorkspace.connectWorkspace === 'function') {
+        try {
+          const value = await uiWorkspace.connectWorkspace(workspaceId)
+          if (typeof value === 'string') sessionId = value
+        } catch (error) {
+          sessionId = ''
+        }
+      }
+      if (!sessionId) return { ok: false, reason: '新会话没建成，再点一次' }
+
+      // 把这条会话的梳理开关打开、把随想记成一条思路，
+      // 这样用户按回车那一轮已经带着梳理提示词。
+      try {
+        await apiPost('/spark/start', { id: spark.id, sessionId })
+      } catch (error) {
+        /* 打不开也继续，至少把输入框填上 */
+      }
+
+      try {
+        if (typeof uiWorkspace.openSession === 'function') uiWorkspace.openSession(sessionId)
+      } catch (error) {
+        /* 已经在新会话里就算了 */
+      }
+
+      const problem = await ensureDraft(ctx, sessionId, text)
+      return { ok: true, sessionId, reason: problem }
+    }
+
     // 随想的读写与状态，挂件页和整页共用一套。
     function useSparkBook() {
       const [text, setText] = useState('')
@@ -272,29 +432,27 @@ window.__ModuleLoader__.load({
         [busy, load],
       )
 
-      // 从这条随想开一条新思路，顺手把这个会话的梳理开关打开。
+      // 从这条随想开一条新会话，把话写进新会话的输入框，并顺手开好梳理开关。
       const start = useCallback(
-        (id, sessionId, onDone) => {
+        (id, onDone) => {
           if (busy) return
-          if (!sessionId) {
-            setFlash('先打开一个对话，再点「去研究」')
-            return
-          }
+          const spark = (items || []).find((item) => item.id === id)
+          if (!spark) return
           setBusy(id)
-          apiPost('/spark/start', { id, sessionId })
-            .then((data) => {
-              if (data && data.ok) {
-                setFlash('已就绪：回到对话说一句就开始梳')
+          openResearchSession(spark)
+            .then((result) => {
+              if (result && result.ok) {
+                setFlash(result.reason || '新会话开好了，输入框里已经写好')
                 load()
                 if (onDone) onDone()
               } else {
-                setFlash('没开成，再试一次')
+                setFlash((result && result.reason) || '没开成，再试一次')
               }
             })
             .catch(() => setFlash('没开成，再试一次'))
             .then(() => setBusy(''))
         },
-        [busy, load],
+        [busy, items, load],
       )
 
       return { text, setText, items, busy, flash, loaded, add, remove, start }
@@ -413,7 +571,7 @@ window.__ModuleLoader__.load({
                   type: 'button',
                   onClick: () => onStart(spark.id),
                   disabled: Boolean(busy),
-                  title: '从这条随想开一条新思路，并把梳理模式打开',
+                  title: '新开一条会话，把这条随想写进输入框，并打开梳理模式',
                   style: {
                     padding: 0,
                     border: 'none',
@@ -427,7 +585,7 @@ window.__ModuleLoader__.load({
                     textDecorationStyle: 'dotted',
                   },
                 },
-                spark.thoughtId ? '接着研究 →' : '去研究 →',
+                spark.thoughtId ? '再研究一次 →' : '去研究 →',
               ),
               h(
                 'button',
@@ -795,6 +953,21 @@ window.__ModuleLoader__.load({
               'div',
               {
                 style: {
+                  padding: '0 14px 6px 44px',
+                  color: 'var(--st-faint)',
+                  fontFamily: HAND_FONT,
+                  fontSize: 11.5,
+                  lineHeight: '17px',
+                },
+              },
+              '点「去研究」会新开一条会话，这句话已经写进输入框；想定方向就在最后补一句。',
+            )
+          : null,
+        state.expanded
+          ? h(
+              'div',
+              {
+                style: {
                   position: 'relative',
                   flex: 1,
                   minHeight: 0,
@@ -810,7 +983,7 @@ window.__ModuleLoader__.load({
                 busy: book.busy,
                 loaded: book.loaded,
                 sessionId,
-                onStart: (id) => book.start(id, sessionId),
+                onStart: (id) => book.start(id),
                 onRemove: book.remove,
               }),
             )
@@ -1588,6 +1761,8 @@ window.__ModuleLoader__.load({
     // ============================================================
 
     function apply(ctx) {
+      runtimeCtx = ctx
+
       ctx.effect(
         () =>
           ctx.slots.inject('conversation.input.left', () =>
@@ -1641,7 +1816,7 @@ window.__ModuleLoader__.load({
     }
 
     out.apply = apply
-    out.inject = ['slots', 'uiSession']
+    out.inject = ['slots', 'uiSession', 'sessions']
     return out
   },
 })
