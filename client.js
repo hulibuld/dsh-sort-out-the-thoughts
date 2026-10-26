@@ -249,22 +249,36 @@ window.__ModuleLoader__.load({
       return ''
     }
 
+    // 固定模板：每条随想进新会话时，前面是那句原文，后面跟同一句固定的开场话。
+    // 不按会话、不按内容拼变量，省掉所有算出来的部分，点下去就能开。
+    const RESEARCH_OPENING = '先把这条想法梳理清楚：它到底在说什么，哪里还含糊，下一步该往哪儿想。'
+
     function researchDraft(spark) {
       const body = String((spark && spark.text) || '').trim()
-      return [body, '', '先把这条想法梳理清楚：它到底在说什么，哪里还含糊，下一步该往哪儿想。'].join('\n')
+      if (!body) return RESEARCH_OPENING
+      return body + '\n\n' + RESEARCH_OPENING
+    }
+
+    // 开关状态变了（比如刚点过「去研究」），让所有还挂着的开关都去对一次账。
+    function announceModeChanged() {
+      try {
+        window.dispatchEvent(new CustomEvent('dsh-sort-out-the-thoughts:mode'))
+      } catch (error) {
+        /* 老浏览器没有 CustomEvent 就靠轮询兜 */
+      }
     }
 
     // startSession 是官方的“新会话”，可以顺带把初始内容（prompt）写进草稿；
     // 但它不返回 id，只能盯着会话清单里新冒出来的那一条。
     async function waitForNewSession(ctx, before) {
-      for (let i = 0; i < 15; i += 1) {
+      for (let i = 0; i < 10; i += 1) {
         const byId = sessionCatalog(ctx)
         const fresh = Object.keys(byId).filter((id) => !before.has(id))
         if (fresh.length > 0) {
           const shown = mainViewSessionId(byId)
           return fresh.includes(shown) ? shown : fresh[fresh.length - 1]
         }
-        await sleep(100)
+        await sleep(60)
       }
       return ''
     }
@@ -293,21 +307,19 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // 官方通道偶尔还没把字落进 composer，兜底自己再写一遍。
+    // 官方通道偶尔还没把字落进 composer。只补一次，不在这儿死等：
+    // 草稿本身不是关键，真丢了用户也能从本子里复制，宁可快一点。
     async function ensureDraft(ctx, sessionId, text) {
-      for (let i = 0; i < 14; i += 1) {
-        const current = draftOf(ctx, sessionId)
-        if (current === text) return ''
-        const composer = composerOf(ctx, sessionId)
-        if (composer && typeof composer.setDraft === 'function') {
-          try {
-            composer.setDraft(text)
-          } catch (error) {
-            /* 下一轮再试 */
-          }
+      if (draftOf(ctx, sessionId) === text) return ''
+      const composer = composerOf(ctx, sessionId)
+      if (composer && typeof composer.setDraft === 'function') {
+        try {
+          composer.setDraft(text)
+        } catch (error) {
+          /* 落不下去就交给用户手填 */
         }
-        await sleep(150)
       }
+      await sleep(60)
       return draftOf(ctx, sessionId) === text ? '' : '输入框没能自动填上，本子里那句话可以直接复制'
     }
 
@@ -364,17 +376,44 @@ window.__ModuleLoader__.load({
 
       // 把这条会话的梳理开关打开、把随想记成一条思路，
       // 这样用户按回车那一轮已经带着梳理提示词。
+      // 这一步必须成功——开关没跟着亮，用户就得自己再点一次。
       try {
-        await apiPost('/spark/start', { id: spark.id, sessionId })
+        const data = await apiPost('/spark/start', { id: spark.id, sessionId })
+        if (!data || data.active !== true) {
+          // 服务端没回报 active，再补一次显式开关，别让按钮停在「关」。
+          await apiPost('/toggle', { sessionId, on: true })
+        }
       } catch (error) {
-        /* 打不开也继续，至少把输入框填上 */
+        try {
+          await apiPost('/toggle', { sessionId, on: true })
+        } catch (inner) {
+          /* 真开不了也得把输入框填上，用户自己点开关 */
+        }
       }
-
+      // 先把界面切过去，用户马上就能看到新会话；开开关、填草稿都在后面并行做。
       try {
         if (typeof uiWorkspace.openSession === 'function') uiWorkspace.openSession(sessionId)
       } catch (error) {
         /* 已经在新会话里就算了 */
       }
+
+      // 把这条会话的梳理开关打开、把随想记成一条思路，
+      // 这样用户按回车那一轮已经带着梳理提示词。
+      // 这一步必须成功——开关没跟着亮，用户就得自己再点一次。
+      try {
+        const data = await apiPost('/spark/start', { id: spark.id, sessionId })
+        if (!data || data.active !== true) {
+          // 服务端没回报 active，再补一次显式开关，别让按钮停在「关」。
+          await apiPost('/toggle', { sessionId, on: true })
+        }
+      } catch (error) {
+        try {
+          await apiPost('/toggle', { sessionId, on: true })
+        } catch (inner) {
+          /* 真开不了也得把输入框填上，用户自己点开关 */
+        }
+      }
+      announceModeChanged()
 
       const problem = await ensureDraft(ctx, sessionId, text)
       return { ok: true, sessionId, reason: problem }
@@ -1034,19 +1073,24 @@ window.__ModuleLoader__.load({
         }
       }, [sessionId, applyState])
 
-      // 开着的时候隔几秒对一次账：AI 在会话里把段推进了，按钮不能还停在上一段。
+      // 隔几秒对一次账：AI 在会话里把段推进了，按钮不能还停在上一段；
+      // 关着的时候也要查——点过「去研究」之后，开关是服务端替它打开的，
+      // 本地不主动查就会一直显示「关」。
       useEffect(() => {
-        if (!sessionId || !on || !ready) return undefined
+        if (!sessionId || !ready) return undefined
         const tick = () => {
           if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
           refresh()
         }
-        const timer = setInterval(tick, 2500)
+        const timer = setInterval(tick, on ? 2500 : 4000)
         const onFocus = () => refresh()
+        const onMode = () => refresh()
         window.addEventListener('focus', onFocus)
+        window.addEventListener('dsh-sort-out-the-thoughts:mode', onMode)
         return () => {
           clearInterval(timer)
           window.removeEventListener('focus', onFocus)
+          window.removeEventListener('dsh-sort-out-the-thoughts:mode', onMode)
         }
       }, [sessionId, on, ready, refresh])
 
@@ -1169,7 +1213,9 @@ window.__ModuleLoader__.load({
         ),
       )
 
-      if (on && current) {
+      // 刚开的新会话里，想法还是空的，这时候不该摆「推进到第 N 段」——
+      // 一句都还没聊，哪来的「这一段够了」。
+      if (on && current && current.filled) {
         parts.push(
           h(
             'button',
