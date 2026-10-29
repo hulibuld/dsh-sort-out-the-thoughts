@@ -64,6 +64,60 @@ window.__ModuleLoader__.load({
     }
 
     // ============================================================
+    // 全局偏好：现在只有「悬浮挂件显示 / 隐藏」。
+    // 设置页和挂件是两处独立的挂载点，用一个模块级缓存 + 订阅让它们同步。
+    // ============================================================
+
+    const PREF_DEFAULTS = { dockHidden: false }
+    const prefListeners = new Set()
+    let prefCache = null
+
+    function readPrefs() {
+      return prefCache || PREF_DEFAULTS
+    }
+
+    function publishPrefs(next) {
+      prefCache = next
+      for (const listener of prefListeners) {
+        try {
+          listener(next)
+        } catch {
+          /* 某个监听者炸了不该连累其他人 */
+        }
+      }
+    }
+
+    function usePrefs() {
+      const [prefs, setPrefs] = useState(readPrefs)
+
+      useEffect(() => {
+        if (!prefCache) {
+          let alive = true
+          apiGet('/prefs')
+            .then((data) => {
+              if (alive) publishPrefs({ ...PREF_DEFAULTS, ...(data || {}) })
+            })
+            .catch(() => {
+              /* 服务没起来就先用默认值，挂件照常显示 */
+            })
+        }
+        const listener = (next) => setPrefs(next)
+        prefListeners.add(listener)
+        return () => {
+          prefListeners.delete(listener)
+        }
+      }, [])
+
+      const update = useCallback((patch) => {
+        const next = { ...readPrefs(), ...patch }
+        publishPrefs(next)
+        apiPost('/prefs', patch).catch(() => {})
+      }, [])
+
+      return [prefs, update]
+    }
+
+    // ============================================================
     // 随想记录本：碎想法先丢进来。做成一颗悬浮球，点开是一本带横线的草稿本。
     // ============================================================
 
@@ -661,6 +715,7 @@ window.__ModuleLoader__.load({
     function SparkDock(props) {
       const sessionId = useCurrentSession(props.currentSession)
       const book = useSparkBook()
+      const [prefs] = usePrefs()
       const [state, setState] = useState(readDockState)
       const [drag, setDrag] = useState(null)
       const gesture = useRef(null)
@@ -754,6 +809,9 @@ window.__ModuleLoader__.load({
         '--st-ring': theme.ring,
         '--st-accent': theme.accent,
       }
+
+      // 设置里把挂件关了，就整颗球都不渲染（想找回来回设置里再打开）
+      if (prefs.dockHidden) return null
 
       if (!state.open) {
         return h(
@@ -1287,11 +1345,43 @@ window.__ModuleLoader__.load({
 
     function ThoughtCard(props) {
       const row = props.row
+      const [confirming, setConfirming] = useState(false)
+      const [busy, setBusy] = useState(false)
+
+      // 点一次只是问一句，再点一下才真删——列表里直接删，不用点进详情。
+      useEffect(() => {
+        if (!confirming) return undefined
+        const timer = setTimeout(() => setConfirming(false), 6000)
+        return () => clearTimeout(timer)
+      }, [confirming])
+
+      const remove = () => {
+        if (busy) return
+        setBusy(true)
+        apiPost('/delete', { id: row.id })
+          .then(() => {
+            setConfirming(false)
+            setBusy(false)
+            if (props.onDeleted) props.onDeleted()
+          })
+          .catch(() => {
+            setBusy(false)
+            setConfirming(false)
+          })
+      }
+
       return h(
-        'button',
+        'div',
         {
-          type: 'button',
+          role: 'button',
+          tabIndex: 0,
           onClick: () => props.onOpen(row.id),
+          onKeyDown: (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault()
+              props.onOpen(row.id)
+            }
+          },
           style: {
             display: 'block',
             width: '100%',
@@ -1343,9 +1433,72 @@ window.__ModuleLoader__.load({
           : null,
         h(
           'div',
-          { style: { marginTop: 6, fontSize: 10, color: C.faint, display: 'flex', gap: 10 } },
+          { style: { marginTop: 6, fontSize: 10, color: C.faint, display: 'flex', alignItems: 'center', gap: 10 } },
           h('span', null, formatTime(row.updatedAt)),
           row.openQuestions ? h('span', null, `${row.openQuestions} 个待解问题`) : null,
+          h(
+            'span',
+            {
+              style: { marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 8 },
+              onClick: (event) => event.stopPropagation(),
+            },
+            confirming
+              ? [
+                  h(
+                    'button',
+                    {
+                      key: 'yes',
+                      type: 'button',
+                      disabled: busy,
+                      onClick: remove,
+                      style: {
+                        padding: 0,
+                        border: 'none',
+                        background: 'transparent',
+                        color: '#d9534f',
+                        fontSize: 10,
+                        fontWeight: 600,
+                        cursor: busy ? 'default' : 'pointer',
+                      },
+                    },
+                    busy ? '删着…' : '确认删掉',
+                  ),
+                  h(
+                    'button',
+                    {
+                      key: 'no',
+                      type: 'button',
+                      onClick: () => setConfirming(false),
+                      style: {
+                        padding: 0,
+                        border: 'none',
+                        background: 'transparent',
+                        color: C.faint,
+                        fontSize: 10,
+                        cursor: 'pointer',
+                      },
+                    },
+                    '算了',
+                  ),
+                ]
+              : h(
+                  'button',
+                  {
+                    type: 'button',
+                    onClick: () => setConfirming(true),
+                    title: '从思路库里删掉这条',
+                    style: {
+                      padding: 0,
+                      border: 'none',
+                      background: 'transparent',
+                      color: C.faint,
+                      fontSize: 10,
+                      cursor: 'pointer',
+                    },
+                  },
+                  '删掉',
+                ),
+          ),
         ),
       )
     }
@@ -1559,6 +1712,7 @@ window.__ModuleLoader__.load({
     }
 
     function ThoughtsCenter(props) {
+      const [prefs, updatePrefs] = usePrefs()
       const [rows, setRows] = useState(null)
       const [error, setError] = useState('')
       const [query, setQuery] = useState('')
@@ -1729,6 +1883,47 @@ window.__ModuleLoader__.load({
           { style: { fontSize: 12, color: C.muted, margin: '0 0 12px', lineHeight: 1.65 } },
           '梳理过的想法都在这里，按体裁归档。每条都能看到它从一句模糊的话长到成稿的轨迹，也能接着往下追问。',
         ),
+        h(
+          'div',
+          {
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              padding: '9px 12px',
+              margin: '0 0 14px',
+              borderRadius: 10,
+              border: '1px solid ' + C.borderSoft,
+              background: C.surface,
+            },
+          },
+          h(
+            'div',
+            { style: { minWidth: 0, flex: '1 1 auto' } },
+            h('div', { style: { fontSize: 12.5, fontWeight: 600 } }, '悬浮笔记本'),
+            h(
+              'div',
+              { style: { fontSize: 11.5, color: C.faint, marginTop: 2, lineHeight: 1.6 } },
+              prefs.dockHidden
+                ? '已隐藏。右下角那颗球不在了，想记随想就在这儿点「显示」把它叫回来。'
+                : '在右下角挂一颗球，点开就是随想记录本。不想看到它就点「隐藏」。',
+            ),
+          ),
+          h(
+            'div',
+            { style: { display: 'flex', gap: 6, flexShrink: 0 } },
+            h(Chip, {
+              label: '显示',
+              active: !prefs.dockHidden,
+              onClick: () => updatePrefs({ dockHidden: false }),
+            }),
+            h(Chip, {
+              label: '隐藏',
+              active: prefs.dockHidden,
+              onClick: () => updatePrefs({ dockHidden: true }),
+            }),
+          ),
+        ),
         tabRow,
       ]
 
@@ -1793,7 +1988,9 @@ window.__ModuleLoader__.load({
                   h(
                     'div',
                     { style: { display: 'grid', gap: 8 } },
-                    group.items.map((row) => h(ThoughtCard, { key: row.id, row, onOpen: setOpenId })),
+                    group.items.map((row) =>
+                      h(ThoughtCard, { key: row.id, row, onOpen: setOpenId, onDeleted: load }),
+                    ),
                   ),
                 ),
               ),
