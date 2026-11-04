@@ -95,6 +95,10 @@ plugin_manager action=remove_bundle target=dsh-sort-out-the-thoughts
 
 卸载不删思路库。想彻底清掉，删掉上面那个数据目录即可。
 
+## 已知问题与修复记录
+
+累计的修复、现象、原因与修法记在 [docs/FIXES.md](docs/FIXES.md)。以后每修一次加一行，别攒着。
+
 ## 许可
 
 MIT。三段推进里「每段有产物、换段有闸门、决定有留痕」这套做法参照了 lunheng-article-pipeline 的闸门思路。
